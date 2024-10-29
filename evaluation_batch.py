@@ -344,8 +344,6 @@ def evaluate(
 
 
 def main(**args):
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
 
     args = lib.utils.AttributeDict(args)
     args.setdefault('dataset', 'openwebtext')
@@ -401,15 +399,6 @@ def main(**args):
     # appropriate.
     torch.set_default_dtype(torch.float64)
 
-    def log1mexp(x):
-        # Computes log(1-exp(-|x|))
-        x = -x.abs()
-        return torch.where(
-            x > -0.693,
-            torch.log(-torch.expm1(x)),
-            torch.log1p(-torch.exp(x))
-        )
-
     def create_modules(dim, n_heads):
         return {
             'noise_schedule': lib.models.NoiseSchedule().float(),
@@ -417,6 +406,7 @@ def main(**args):
             'embedding_matrix': lib.models.EmbeddingMatrix(args.vocab_size, args.embed_dim).float(),
             'model': lib.models.DiffusionModel(dim, args.embed_dim, args.n_blocks, n_heads, args.vocab_size).float()
         }
+    
     modules = create_modules(args.dim, args.n_heads)
     base_modules = create_modules(256, 4)
     delta_modules = create_modules(128, 2)
@@ -439,9 +429,6 @@ def main(**args):
     (test_loader,), (word2idx, idx2word), tokenizer = get_dataloaders(
         args.dataset, args.batch_size, args.seq_len, args.cot, args.digit, only_test=True
     )
-
-    if args.dpm_solver:
-        args.noise_schedule = NoiseSchedulePlaid(modules['noise_schedule'])
 
     evaluate(
         args, 

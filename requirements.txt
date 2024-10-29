@@ -12,3 +12,8 @@ zstandard==0.21.0
 xformers==0.0.23
 torch
 datasets==2.15.0
+
+# apex
+git clone https://github.com/NVIDIA/apex
+cd apex
+pip install -v --disable-pip-version-check --no-build-isolation --no-cache-dir ./
