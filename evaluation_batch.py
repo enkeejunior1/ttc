@@ -64,137 +64,94 @@ def ids_to_txts(tokenizer, x_samples):
     return [tokenizer.decode(x.tolist() if isinstance(x, torch.Tensor) else x, skip_special_tokens=False) 
             for x in x_samples]
 
-
+@torch.no_grad()
 def generate_samples(x, src_mask, modules, args, timesteps_togo=None):
     '''We go args.sampling_timesteps steps for all inputs if timesteps_togo is None'''
-    with torch.no_grad():
-        embedding_matrix = modules['embedding_matrix']()
-        x_embed = embedding_matrix[x] # batch,seq_len, dim
+    embedding_matrix = modules['embedding_matrix']()
+    x_embed = embedding_matrix[x] # batch,seq_len, dim
 
-        if args.dpm_solver:
-            noise = torch.randn(x_embed.shape, device=x_embed.device)
-            x_noised = torch.where(src_mask[...,None], x_embed, noise)
+    gamma_0, gamma_1 = modules['gamma_bounds']()
+
+    z = torch.randn(x_embed.shape, device='cuda') * args.initial_noise_scale
+    x_selfcond = torch.zeros_like(z).float()
+
+    unfinished = x.new_ones(x_embed.shape[0], dtype=bool)
+    end = False
+    logits = None
+    for i, t in enumerate(torch.linspace(1., 0., args.sampling_timesteps)):
+        t = t[None].cuda()
+        s = t - 1. / args.sampling_timesteps
+        gamma_s = modules['noise_schedule'](s).double()
+        gamma_t = modules['noise_schedule'](t).double()
+        gamma_s = gamma_0 + (gamma_1 - gamma_0) * gamma_s
+        gamma_t = gamma_0 + (gamma_1 - gamma_0) * gamma_t
+        alpha_squared_s = torch.sigmoid(-gamma_s)
+        alpha_squared_t = torch.sigmoid(-gamma_t)
+        alpha_s = alpha_squared_s.sqrt()
+        alpha_t = alpha_squared_t.sqrt()
+        sigma_squared_s = torch.sigmoid(gamma_s)
+        sigma_squared_t = torch.sigmoid(gamma_t)
+        sigma_s = sigma_squared_s.sqrt()
+        sigma_t = sigma_squared_t.sqrt()
+
+        logits_partial, x_reconst = modules['model'](
+            z=z[unfinished].to(torch.float32, copy=True),
+            gamma=gamma_t.float(),
+            embedding_matrix=embedding_matrix,
+            bias_scale=1.,
+            x_selfcond=x_selfcond[unfinished],
+            x_embed=x_embed[unfinished] if args.fix_src else None,
+            src_mask=src_mask[unfinished] if args.fix_src else None
+        )
+        if logits is None:
+            logits = logits_partial
+        else:
+            logits[unfinished] = logits_partial
+
+        x_selfcond[unfinished] = x_reconst.clone().detach()
+        x_reconst = x_reconst.double()
+        epsilon_pred = (z[unfinished] - (alpha_t * x_reconst)) / sigma_t
+        epsilon_pred /= args.score_temp
+        x_reconst = (z[unfinished] - (sigma_t * epsilon_pred)) / alpha_t
             
-            ## init a model_fn such that self_cond is reinitialized
-            ## Convert your discrete-time `model` to the continuous-time
-            ## noise prediction model. Here is an example for a diffusion model
-            ## `model` with the noise prediction type ("noise") 
-            model_kwargs = {'x_selfcond':  torch.zeros_like(x_embed).float(),
-                            'x_embed': x_embed,
-                            'src_mask': src_mask,
-                            'logits': None,
-                            'score_temp': 1,
-                            'cur_t_count': 0,
-                            'total_t_count': args.sampling_timesteps
-                            }
-            model_fn = model_wrapper(
-                ModelWrapper(modules),
-                args.noise_schedule,
-                model_type="x_start",  # or "x_start" or "v" or "score"
-                model_kwargs=model_kwargs,
-                guidance_type="uncond",
-            )
+        if t > 0:
+            # App A.4, p(z_s|z_t), NN gives x_reconst based on z_t, then reparam. x_reconst to get z_s
+            c = -torch.expm1(gamma_s - gamma_t)
+            z[unfinished] *= (1 - c) * alpha_squared_s.sqrt() / alpha_squared_t.sqrt()
+            z[unfinished] += c * (alpha_squared_s.sqrt() * x_reconst.double())
+            z[unfinished] += (c * (1 - alpha_squared_s)).sqrt() * torch.randn_like(z[unfinished])
 
-            ## Define dpm-solver and sample by multistep DPM-Solver.
-            ## (We recommend multistep DPM-Solver for conditional sampling)
-            ## You can adjust the `steps` to balance the computation
-            ## costs and the sample quality.
-            dpm_solver = DPM_Solver(model_fn, args.noise_schedule, algorithm_type="dpmsolver++")
+        if timesteps_togo is not None:
+            for j, _ in enumerate(x):
+                if unfinished[j] and i+1 == timesteps_togo[j]: # i -> i+1
+                    unfinished[j] = False
+                    if all(~unfinished):
+                        end = True
+            if end: 
+                break
 
-            x_sample = dpm_solver.sample(
-                x_noised,
-                steps=args.sampling_timesteps,
-                order=1,  # or 2
-                skip_type="time_uniform",
-                method="multistep",
-                input_ids_mask=~src_mask[...,None],
-                x_start=x_embed,
-            )
-            logits = model_kwargs['logits']
+    logits, _ = modules['model'](
+        z=z.float(),
+        gamma=gamma_t.float(),
+        embedding_matrix=embedding_matrix,
+        bias_scale=1.,
+        x_selfcond=x_selfcond,
+        x_embed=x_embed if args.fix_src else None,
+        src_mask=src_mask if args.fix_src else None
+    )
 
-        else:
-            gamma_0, gamma_1 = modules['gamma_bounds']()
+    if args.logit_sample and args.logit_temp > 0:
+        logits = logits / args.logit_temp
+        _reshaped_logits = logits.reshape(-1, logits.shape[-1])
+        _reshapedx_samples = torch.multinomial(_reshaped_logits.softmax(dim=-1), num_samples=1).squeeze(-1)
+        x_samples = _reshapedx_samples.reshape(logits.shape[:-1])
+    else:
+        x_samples = logits.argmax(dim=-1)
+    
+    if args.fix_src:
+        x_samples = torch.where(src_mask, x, x_samples)
 
-            z = torch.randn(x_embed.shape, device='cuda') * args.initial_noise_scale
-            x_selfcond = torch.zeros_like(z).float()
-
-            unfinished = x.new_ones(x_embed.shape[0], dtype=bool)
-            end = False
-            logits = None
-            for i, t in enumerate(torch.linspace(1., 0., args.sampling_timesteps)):
-                t = t[None].cuda()
-                s = t - 1. / args.sampling_timesteps
-                gamma_s = modules['noise_schedule'](s).double()
-                gamma_t = modules['noise_schedule'](t).double()
-                gamma_s = gamma_0 + (gamma_1 - gamma_0) * gamma_s
-                gamma_t = gamma_0 + (gamma_1 - gamma_0) * gamma_t
-                alpha_squared_s = torch.sigmoid(-gamma_s)
-                alpha_squared_t = torch.sigmoid(-gamma_t)
-                alpha_s = alpha_squared_s.sqrt()
-                alpha_t = alpha_squared_t.sqrt()
-                sigma_squared_s = torch.sigmoid(gamma_s)
-                sigma_squared_t = torch.sigmoid(gamma_t)
-                sigma_s = sigma_squared_s.sqrt()
-                sigma_t = sigma_squared_t.sqrt()
-
-                logits_partial, x_reconst = modules['model'](
-                    z=z[unfinished].to(torch.float32, copy=True),
-                    gamma=gamma_t.float(),
-                    embedding_matrix=embedding_matrix,
-                    bias_scale=1.,
-                    x_selfcond=x_selfcond[unfinished],
-                    x_embed=x_embed[unfinished] if args.fix_src else None,
-                    src_mask=src_mask[unfinished] if args.fix_src else None
-                )
-                if logits is None:
-                    logits = logits_partial
-                else:
-                    logits[unfinished] = logits_partial
-
-                x_selfcond[unfinished] = x_reconst.clone().detach()
-                x_reconst = x_reconst.double()
-                epsilon_pred = (z[unfinished] - (alpha_t * x_reconst)) / sigma_t
-                epsilon_pred /= args.score_temp
-                x_reconst = (z[unfinished] - (sigma_t * epsilon_pred)) / alpha_t
-                    
-                if t > 0:
-                    # App A.4, p(z_s|z_t), NN gives x_reconst based on z_t, then reparam. x_reconst to get z_s
-                    c = -torch.expm1(gamma_s - gamma_t)
-                    z[unfinished] *= (1 - c) * alpha_squared_s.sqrt() / alpha_squared_t.sqrt()
-                    z[unfinished] += c * (alpha_squared_s.sqrt() * x_reconst.double())
-                    z[unfinished] += (c * (1 - alpha_squared_s)).sqrt() * torch.randn_like(z[unfinished])
-
-                if timesteps_togo is not None:
-                    for j, _ in enumerate(x):
-                        if unfinished[j] and i+1 == timesteps_togo[j]: # i -> i+1
-                            unfinished[j] = False
-                            if all(~unfinished):
-                                end = True
-                    if end: 
-                        break
-
-            logits, _ = modules['model'](
-                z=z.float(),
-                gamma=gamma_t.float(),
-                embedding_matrix=embedding_matrix,
-                bias_scale=1.,
-                x_selfcond=x_selfcond,
-                x_embed=x_embed if args.fix_src else None,
-                src_mask=src_mask if args.fix_src else None
-            )
-
-        if args.logit_sample and args.logit_temp > 0:
-            logits = logits / args.logit_temp
-            _reshaped_logits = logits.reshape(-1, logits.shape[-1])
-            _reshapedx_samples = torch.multinomial(_reshaped_logits.softmax(dim=-1), num_samples=1).squeeze(-1)
-            x_samples = _reshapedx_samples.reshape(logits.shape[:-1])
-        else:
-            x_samples = logits.argmax(dim=-1)
-        
-        if args.fix_src:
-            x_samples = torch.where(src_mask, x, x_samples)
-
-        return x_samples
+    return x_samples
 
 def generate_cot_samples(x, src_mask, modules, args):
     batch_size = x.shape[0]
@@ -359,7 +316,6 @@ def main(**args):
     args.setdefault('initial_noise_scale', 1.0)
     args.setdefault('batch_size', 168)
     args.setdefault('sampling_timesteps', 64)
-    args.setdefault('dpm_solver', False)
     args.setdefault('score_temp', 0.5)
     # add logit sampling procedures
     args.setdefault('logit_sample', False)
@@ -375,8 +331,6 @@ def main(**args):
     eval_log_name = f"eval-{args.sampling_timesteps}-score_{args.score_temp}"
     if args.apply_sc:
         eval_log_name += f'-sc'
-    if args.dpm_solver:
-        eval_log_name += '-dpmsolver'
     if args.logit_sample:
         eval_log_name += f'-logit-{args.logit_temp}'
 
