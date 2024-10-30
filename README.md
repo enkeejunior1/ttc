@@ -1,16 +1,10 @@
-# ttc
-Do DDMs show effective test-time-compute performance?
+# References
 
-### $4 \times 4$, $5 \times 5$ multiplication
 
-```bash
-# dot (T=64 by default)
-weights_path="weights_path"
-python3 evaluation_batch.py      \
-    --weights_path $weights_path \
-    --fix_src               \
-    --digit                 \
-    --dataset gsm8k         \
-    --score_temp 0.5        \
-    --sampling_timesteps 8
-```
+
+---
+
+# References
+
+This repo is heavily based on
+- [Implicit Chain of Thought Reasoning via Knowledge Distillation](https://github.com/da03/implicit_chain_of_thought/?tab=readme-ov-file)
