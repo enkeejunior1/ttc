@@ -1,10 +1,12 @@
 ########################
 # SEDD/Loss, Scheduler #
 ########################
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
 from einops import einsum
 from typing import Union
 
@@ -14,39 +16,32 @@ class Loss(nn.Module):
         super().__init__()
         self.scheduler = scheduler
 
-    def forward(self, output, sigma_bar=None, xt=None, x0=None, reduction="mean", **kwargs):
+    def forward(self, output, t=None, xt=None, x0=None, attention_mask=None, **kwargs):
         """
         TODO: need to verify the code
         """
-        log_score = output
+        logits = self.scheduler.output_to_logits(output, xt)
+        attn_mask  = torch.ones_like(x0).bool() if attention_mask is None else attention_mask # TODO
+        trans_mask = torch.logical_and(x0 != self.scheduler.mask_idx, xt == self.scheduler.mask_idx)
+        token_mask = torch.logical_and(attn_mask, trans_mask)
 
-        # sigma = self.scheduler.sigma[t].unsqueeze(1).expand_as(xt)
-        expm1_sigma_bar = torch.where(
-            sigma_bar < 0.5,
-            torch.expm1(sigma_bar),
-            torch.exp(sigma_bar) - 1
-        )
+        assert len(t.shape) == 1
+        sigma_bar_t = self.scheduler.sigma_bar(t)
+        sigma_t = self.scheduler.sigma(t)
+        
+        log_p_theta = torch.gather(
+            input=logits.log_softmax(dim=-1), dim=-1, index=x0[:, :, None]
+        ).squeeze(-1)
+        
+        loss = -log_p_theta * (sigma_t / torch.expm1(sigma_bar_t))[:, None]
+        nlls = loss[token_mask]
+        count = token_mask.sum()
+        if count == 0:
+            warnings.warn("Warning: there are no tokens for training. Zero flip.")
+            return 0
+        else:
+            return nlls.sum() / count
 
-        # below is the SEDD loss:
-        token_pos = torch.logical_and(xt == self.scheduler.mask_idx, x0 != self.scheduler.mask_idx)
-        ratio = 1 / expm1_sigma_bar[:, None].expand_as(xt)[token_pos] # p(y|x0) / p(xt|x0) = exp(-sigma) / (1 - exp(-sigma))
-        y = x0[token_pos]
-
-        neg = ratio * torch.gather(log_score[token_pos], -1, y[..., None]).squeeze(-1)
-        pos = log_score[token_pos][:, :-1].exp().sum(dim=-1) # pos = torch.gather(log_score[token_pos].exp(), -1, y[..., None]).squeeze()
-        const = ratio * (ratio.log() - 1) # there are no constant term in algorithm 1
-
-        loss = torch.zeros(*xt.shape, device=xt.device)
-        loss[token_pos] += (pos - neg + const) # DWDSE loss (but simple loss, do not use sigma scale, i.e., sigma[token_pos] * (pos - neg + const)
-
-        if loss.isnan().any():
-            raise ValueError('loss nan detected')
-        if reduction == "mean":
-            loss = loss.mean()
-        if reduction == "sum":
-            loss = loss.sum()
-        return loss
-    
 
 class Scheduler(nn.Module):
     """
@@ -82,22 +77,42 @@ class Scheduler(nn.Module):
         self, samples: torch.LongTensor, t: Union[int, torch.LongTensor], generator=None, 
     ):
         '''x0 -> xt'''
+        # snr
+        sigma_bar = self.sigma_bar(t)
+        
         # perturb samples (absorb)
-        perturb_prob = 1 - (-self.sigma_bar(t)).exp()
+        perturb_prob = 1 - (-sigma_bar).exp()
         perturbed_samples = torch.where(
             torch.rand(*samples.shape, device=samples.device, generator=generator) < perturb_prob[:, None],
             self.mask_idx, samples
         )
         return perturbed_samples
     
-    def output_to_score(self, output, t=None):
-        if self.model_name == 'sedd':
-            score = output.exp()
-        return score
+    def output_to_logits(self, output, xt=None, t=None):
+        if self.model_name == 'mdlm': 
+            # ref: https://github.com/kuleshov-group/mdlm/blob/master/diffusion.py#L261
+            # _subs_parameterization
+            assert xt is not None
+            logits = output
+
+            # prob = logits.exp()
+            logits[:, :, self.mask_idx] = -torch.inf
+            logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+
+            # prob(xt[unmasked indices] = xt) = 1
+            unmasked_indices = (xt != self.mask_idx)
+            logits[unmasked_indices] = -torch.inf
+            logits[unmasked_indices, xt[unmasked_indices]] = 0
+        else:
+            raise ValueError(f'invalid model_name: {self.model_name}')
+        return logits
     
     def sample_latent(self, num_samples):
-        return self.mask_idx * torch.ones(num_samples, self.length).long()
+        return (self.num_vocabs-1) * torch.ones(num_samples, self.length).long()
 
+    def step(self, output, xt, t, step_size):
+        pass
+    
     @torch.no_grad()
     def euler_sample(self, model, xt, t, s, euler_steps=1, sample_steps=5):
         '''xt -> xu, with euler sampling'''
@@ -125,54 +140,40 @@ class Scheduler(nn.Module):
 
 
 class SchedulerOutput:
-    def __init__(self, xt, xt_prob=None, rev_rate=None, tau=None, noise=None):
+    def __init__(self, xt, xt_prob=None, x0_prob=None, rev_rate=None, tau=None, noise=None):
         self.xt = xt
         self.tau = tau
+        self.x0_prob = x0_prob
         self.xt_prob = xt_prob
         self.rev_rate = rev_rate
         self.noise = noise
 
 
 class EulerScheduler(Scheduler):
-    def Q_tok(self, i):
-        '''Q_tok = Q[i, :] (Eq.16 from SEDD paper)'''
-        edge = -F.one_hot(i, num_classes=self.num_vocabs)
-        edge[i == self.mask_idx] += 1
-        return edge
-    
-    def Q_tilde(self, xt, score):
-        normalized_rate = self.Q_tok(xt) * score
-        # ref: https://github.com/louaaron/Score-Entropy-Discrete-Diffusion/blob/main/graph_lib.py
-        # to ensure that maintain the rate matrix property (sum_j R_ij = 0)
-        normalized_rate.scatter_(-1, xt[..., None], torch.zeros_like(normalized_rate))
-        normalized_rate.scatter_(-1, xt[..., None], -normalized_rate.sum(dim=-1, keepdim=True))
-        return normalized_rate
+    def step(self, output, xt, t, step_size, generator=None, if_last=False, **kwargs):
+        sigma_t = self.sigma_bar(t)
+        sigma_s = self.sigma_bar(t - step_size)
 
-    def step(self, output, xt, t, step_size, rev_rate=None, generator=None, if_last=False):
-        if rev_rate is None:
-            sigma = self.sigma(t)
-            score = self.output_to_score(output)
-            rev_rate = sigma[..., None, None] * self.Q_tilde(xt, score)
-        step_size = match_dimensions(step_size, rev_rate)
+        if sigma_t.ndim > 1:
+            sigma_t = sigma_t.squeeze(-1)
+        if sigma_s.ndim > 1:
+            sigma_s = sigma_s.squeeze(-1)
+        assert sigma_t.ndim == 1, sigma_t.shape
+        assert sigma_s.ndim == 1, sigma_s.shape
 
-        identity = F.one_hot(xt, num_classes=self.num_vocabs).to(rev_rate)
-        xt_prob = identity + step_size * rev_rate
-        xt_prob = xt_prob[..., :-1] if if_last else xt_prob
-        xt, noise = sample_categorical(xt_prob, generator=generator)
-        return SchedulerOutput(xt, xt_prob=xt_prob, rev_rate=rev_rate, noise=noise)
-    
+        alpha_t = 1 - torch.exp(-sigma_t)
+        alpha_s = 1 - torch.exp(-sigma_s)
+        alpha_t = alpha_t[:, None, None]
+        alpha_s = alpha_s[:, None, None]
 
-def match_dimensions(x, y):
-    x_shape = list(x.shape)
-    y_shape = list(y.shape)
-    
-    # Iterate over the shape of y and adjust x's shape by adding singleton dimensions where necessary
-    for i in range(len(y_shape)):
-        if i >= len(x_shape) or x_shape[i] != y_shape[i]:
-            x = x.unsqueeze(i)
-            x_shape.insert(i, 1)  # Update x's shape with the new singleton dimension
-            
-    return x
+        logits = self.output_to_logits(output, xt)
+        q_xs = logits.exp() * (alpha_t - alpha_s)
+        q_xs[:, :, self.mask_idx] = alpha_s[:, :, 0] if not if_last else -torch.inf
+        xs, noise = sample_categorical(q_xs)
+
+        copy_flag = (xt != self.mask_idx).to(xt.dtype)
+        xs = copy_flag * xt + (1 - copy_flag) * xs
+        return SchedulerOutput(xs, xt_prob=q_xs, x0_prob=logits.softmax(dim=-1), noise=noise)
 
 def sample_categorical(categorical_probs, eps=1e-6, generator=None):
     '''use gumbel-max trick, but given probability'''
