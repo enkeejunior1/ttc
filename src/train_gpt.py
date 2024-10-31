@@ -94,7 +94,7 @@ def main():
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     ctx = torch.amp.autocast(device_type='cuda', dtype=ptdtype)
-    print(ptdtype, dtype, device)
+    print(ptdtype, dtype, device, torch.cuda.current_device())
 
     # Create Teacher 
     config = TeacherConfig(base_model=args.base_model)
@@ -137,9 +137,10 @@ def main():
             if step % 100 == 0:
                 print(f"Step: {step}. PPL: {ppl}. Token Accuracy: {token_accuracy}")
             step += 1
+        teacher.save_pretrained(os.path.join(args.save_model, f'checkpoint_{epoch}'))
         accuracy, token_accuracy, ppl = evaluate(val_dataloader, tokenizer, ctx, teacher, args.max_new_tokens)
         print(f'Val. PPL: {ppl}; Accuracy: {accuracy}; Token Accuracy: {token_accuracy}.')
-        teacher.save_pretrained(os.path.join(args.save_model, f'checkpoint_{epoch}'))
+        
 
 if __name__ == "__main__":
     main()
