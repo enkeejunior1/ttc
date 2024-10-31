@@ -21,7 +21,7 @@ logging.disable(logging.WARNING) # disable WARNING, INFO and DEBUG logging every
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def save_model(model, tokenizer, model_dir):
-    prin ('saving', model_dir)
+    print('saving', model_dir)
     os.makedirs(model_dir, exist_ok=True)
     model.save_pretrained(model_dir)
     tokenizer.save_pretrained(model_dir)
