@@ -28,7 +28,9 @@ export BSZ=32
 export SAVE="train_models/${order}_by_${order}_mult/gpt2/teacher"
 echo $SAVE
 mkdir -p $SAVE
-TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=1 python src/train_gpt.py \
+export TOKENIZERS_PARALLELISM=false 
+export CUDA_VISIBLE_DEVICES="0"
+python src/train_gpt.py \
     --train_path ${FOLDER}/train.txt \
     --val_path ${FOLDER}/valid.txt \
     --epochs $EPOCHS    \
