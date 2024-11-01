@@ -11,13 +11,14 @@ import sys
 sys.path.append("..")
 from utils import get_sep_position, DoubleEOSStoppingCriteria, DoubleEOSLogitsProcessor
 from .modeling_gpt2_implicit import GPT2LMHeadImplicitModel
+from transformers import GPT2LMHeadModel
 
 
 class Teacher(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.base_model = GPT2LMHeadImplicitModel.from_pretrained(config.base_model)
+        self.base_model = GPT2LMHeadModel.from_pretrained(config.base_model)
         self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
         num_layers = len(self.base_model.transformer.h)
         hidden_size = self.base_model.config.hidden_size
