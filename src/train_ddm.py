@@ -1,7 +1,7 @@
 import math
 import torch
 from torch.utils.data import DataLoader
-from transformers import AdamW
+from transformers import AdamW, GPT2TokenizerFast
 import argparse
 import os
 import tqdm
@@ -13,6 +13,7 @@ from models.configuration_teacher import TeacherConfig
 from data import CoTDataset, CoTDataCollator, extract_answer
 
 from utils import get_sep_position
+from transformers import AutoModelForMaskedLM
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -20,6 +21,46 @@ logging.disable(logging.WARNING) # disable WARNING, INFO and DEBUG logging every
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+def load_pretrained_model(args):
+    if args.base_model == "sedd":
+        # load model
+        from ddms.sedd import SEDD
+        model = SEDD.from_pretrained("louaaron/sedd-small")
+
+        # load config
+        args.num_vocabs = model.config.tokens
+        args.length = model.config.model.length
+        args.noise_schedule = model.config.noise.type
+        args.graph = 'absorb'
+    
+    if args.base_model == "mdlm":
+        model = AutoModelForMaskedLM.from_pretrained("kuleshov-group/mdlm-owt", trust_remote_code=True)
+        
+        # load config
+        args.num_vocabs = model.config.vocab_size - 1
+        args.length = model.config.model_length
+        args.noise_schedule = 'loglinear'
+        args.graph = 'absorb'
+    
+    return model, args
+
+def load_diffusion_scheduler(args):
+    if args.base_model == "sedd":
+        from ddms import sedd
+        scheduler = sedd.EulerScheduler(args)
+    if args.base_model == "mdlm":
+        from ddms import mdlm
+        scheduler = mdlm.EulerScheduler(args)
+    return scheduler
+
+def load_ddm_loss_fn(args, model, scheduler):
+    if args.base_model == "sedd":
+        from ddms import sedd
+        loss_fn = sedd.Loss(model, scheduler)
+    if args.base_model == "mdlm":
+        from ddms import mdlm
+        loss_fn = mdlm.Loss(model, scheduler)
+    return loss_fn
 
 def save_model(model, tokenizer, model_dir):
     print ('saving', model_dir)
@@ -83,7 +124,7 @@ def main():
     parser.add_argument('--val_path', type=str, required=True)
     parser.add_argument('--save_model', type=str, required=True)
     parser.add_argument('--max_new_tokens', type=int, default=128)
-    parser.add_argument('--base_model', type=str, default='gpt2')
+    parser.add_argument('--base_model', type=str, default='sedd')
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=5e-5)
@@ -99,11 +140,13 @@ def main():
     print (ptdtype, dtype, device)
 
     # Create Teacher 
-    config = TeacherConfig(base_model=args.base_model)
-    teacher = Teacher(config).to(device).to(ptdtype)
+    teacher, args = load_pretrained_model(args)
+    scheduler = load_diffusion_scheduler(args)
+    loss_fn = load_ddm_loss_fn(args, teacher, scheduler)
 
     # Load data
-    tokenizer = teacher.tokenizer
+    tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
+    eos_token_idx = tokenizer.encode(tokenizer.eos_token)[0]
     collate_fn = CoTDataCollator(tokenizer)
     train_dataset = CoTDataset(tokenizer, args.train_path, 1024)
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=collate_fn, shuffle=True)
@@ -117,6 +160,7 @@ def main():
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, **extra_args)
 
     teacher.train()
+    teacher = teacher.to(device, ptdtype)
 
     # Train
     step = 0
@@ -126,10 +170,11 @@ def main():
         for batch in tqdm.tqdm(train_dataloader):
             input_ids = batch['input_ids_all'].to(device)
             labels = batch['labels_all'].to(device)
+            conds = batch['input_ids_only'].to(device) == eos_token_idx
             with ctx:
-                outputs = teacher.compute_loss(input_ids=input_ids, labels=labels)
+                outputs = loss_fn(input_ids=input_ids, labels=labels, conds=conds)
             loss = outputs.loss
-            token_accuracy = outputs.token_accuracy.item()
+            token_accuracy = outputs.token_accuracy
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
@@ -139,9 +184,9 @@ def main():
             if step % 100 == 0:
                 print (f"Step: {step}. PPL: {ppl}. Token Accuracy: {token_accuracy}")
             step += 1
+        teacher.save_pretrained(os.path.join(args.save_model, f'checkpoint_{epoch}'))
         accuracy, token_accuracy, ppl = evaluate(val_dataloader, tokenizer, ctx, teacher, args.max_new_tokens)
         print (f'Val. PPL: {ppl}; Accuracy: {accuracy}; Token Accuracy: {token_accuracy}.')
-        teacher.save_pretrained(os.path.join(args.save_model, f'checkpoint_{epoch}'))
-
+        
 if __name__ == "__main__":
     main()
