@@ -46,11 +46,13 @@ def load_pretrained_model(args):
 
 def load_diffusion_scheduler(args):
     if args.base_model == "sedd":
-        from ddms import sedd
-        scheduler = sedd.EulerScheduler(args)
+        pass
     if args.base_model == "mdlm":
         from ddms import mdlm
-        scheduler = mdlm.EulerScheduler(args)
+        if args.scheduler_name == "euler":
+            scheduler = mdlm.EulerScheduler(args)
+        if args.scheduler_name == "maskgit":
+            scheduler = mdlm.MaskGITScheduler(args)
     return scheduler
 
 def load_ddm_loss_fn(args, model, scheduler):

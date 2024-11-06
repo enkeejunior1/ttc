@@ -46,11 +46,13 @@ def load_pretrained_model(args):
 
 def load_diffusion_scheduler(args):
     if args.base_model == "sedd":
-        from ddms import sedd
-        scheduler = sedd.EulerScheduler(args)
+        pass
     if args.base_model == "mdlm":
         from ddms import mdlm
-        scheduler = mdlm.EulerScheduler(args)
+        if args.scheduler_name == "euler":
+            scheduler = mdlm.EulerScheduler(args)
+        if args.scheduler_name == "maskgit":
+            scheduler = mdlm.MaskGITScheduler(args)
     return scheduler
 
 @torch.no_grad()
@@ -113,6 +115,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--test_path', type=str, required=True)
     parser.add_argument('--model_path', type=str, required=True)
+    parser.add_argument('--scheduler_name', type=str, required=True)
     parser.add_argument('--max_new_tokens', type=int, default=128)
     parser.add_argument('--batch_size', type=int, default=1)
     args = parser.parse_args()

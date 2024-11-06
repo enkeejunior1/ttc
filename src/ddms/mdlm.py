@@ -29,7 +29,7 @@ class Loss(nn.Module):
         xt[:, :conds.shape[1]][conds] = x0[:, :conds.shape[1]][conds]
 
         # model forward
-        output = self.model(xt, sigma_bar_t)
+        output = self.model(xt, torch.zeros_like(sigma_bar_t))
 
         # MDLM loss
         logits = self.scheduler.output_to_logits(output, xt)
@@ -39,7 +39,8 @@ class Loss(nn.Module):
 
         assert len(t.shape) == 1
         log_p_theta = torch.gather(
-            input=logits.log_softmax(dim=-1), dim=-1, index=x0[:, :, None]
+            input=logits, # input=logits.log_softmax(dim=-1), 
+            dim=-1, index=x0[:, :, None],
         ).squeeze(-1)
         
         loss = -log_p_theta * (sigma_t / torch.expm1(sigma_bar_t))[:, None]
@@ -54,10 +55,12 @@ class Loss(nn.Module):
             token_accuracy = (logits.argmax(dim=-1) == x0)[token_mask].float().mean().item()
         return LossOutput(loss=loss, token_accuracy=token_accuracy)
 
+
 class LossOutput:
     def __init__(self, loss=None, token_accuracy=None, **kwargs):
         self.loss = loss
         self.token_accuracy = token_accuracy
+
 
 class Scheduler(nn.Module):
     """
@@ -132,26 +135,40 @@ class Scheduler(nn.Module):
     @torch.no_grad()
     def euler_sample(self, model, xt, t, s, num_inference_steps=5):
         '''xt -> xu, with euler sampling'''
+        t=t * torch.ones(xt.shape[0], device=xt.device) if isinstance(t, float) else t
+        s=s * torch.ones(xt.shape[0], device=xt.device) if isinstance(s, float) else s
         assert (t > s).all(), f'{t}, {s}'
         assert (s > 0).all(), f'{s}, {self.eps}'
         timesteps = torch.linspace(1, self.eps, num_inference_steps+1, device=xt.device)
         timesteps = (t[:, None] - s[:, None]) * timesteps[None, :] + s[:, None]
-        noises = []
-        xt_traj = []
         for i in range(num_inference_steps):
             dt = timesteps[:, i] - timesteps[:, i+1]
             curr_t = timesteps[:, i]
 
             sigma_bar_t = self.sigma_bar(curr_t)
-            output = model(xt, sigma_bar_t)
+            output = model(xt, torch.zeros_like(sigma_bar_t))
             output = self.step(output, xt, curr_t, dt)
             xt = output.xt
-            
-            xt_traj.append(xt)
-            noises.append(output.noise)
-        xt_traj = torch.stack(xt_traj, dim=1)
-        noises = torch.stack(noises, dim=1)
-        return xt, xt_traj, noises, timesteps[:, 1:]
+        return xt
+    
+    @torch.no_grad()
+    def maskgit_sample(self, model, xt, num_inference_steps=5):
+        '''xt -> xu, with euler sampling'''
+        length = (xt == self.mask_idx).sum(dim=0)
+
+        eps = 1e-3
+        t = torch.linspace(1, eps, num_inference_steps + 1)
+        k = (1 - (-self.sigma_bar(t)).exp()) * length
+        k = k.long()
+        k[-1] = 0
+
+        for i in range(num_inference_steps):
+            dk = k[i] - k[i+1]
+            sigma_bar_t = self.sigma_bar(k[None, i])
+            output = model(xt, torch.zeros_like(sigma_bar_t))
+            output = self.step(output, xt, dk)
+            xt = output.xt
+        return xt
 
 
 class SchedulerOutput:
@@ -190,24 +207,22 @@ class EulerScheduler(Scheduler):
         xs = copy_flag * xt + (1 - copy_flag) * xs
         return SchedulerOutput(xs, xt_prob=q_xs, x0_prob=logits.softmax(dim=-1), noise=noise)
     
-        # # eq 7
-        # alpha_t = (-self.sigma_bar(t)).exp()[0].item()
-        # alpha_s = (-self.sigma_bar(t - step_size)).exp()[0].item()
 
-        # x0_prob = self.output_to_logits(output, xt, t).exp()
-        # xs_prob = torch.zeros_like(x0_prob)
-        # mask = (xt == self.mask_idx)[..., None].repeat(1,1,self.num_vocabs)
+class MaskGITScheduler(Scheduler):
+    def step(self, output, xt, step_size, generator=None, if_last=False, **kwargs):
+        # generate x0 ~ p_x0
+        logits = self.output_to_logits(output, xt)
+        p_x0 = logits.exp()
+        p_x0[:, :, self.mask_idx] = -torch.inf
+        x0, noise = sample_categorical(p_x0)
 
-        # # mask idx
-        # xs_prob[mask] = (alpha_s - alpha_t) * x0_prob[mask] / (1 - alpha_t)
-        # xs_prob[..., self.mask_idx][mask[..., -1]] = (1 - alpha_s) / (1 - alpha_t)
-
-        # # non mask idx
-        # xs_prob[~mask] = x0_prob[~mask]
-
-        # xs_prob = xs_prob[..., :-1] if if_last else xs_prob
-        # xs = sample_categorical(xs_prob, generator=generator)
-        # return SchedulerOutput(xs, xt_prob=xs_prob, x0_prob=x0_prob)
+        # mask x0 w.r.t confidence 
+        conf = torch.gather(p_x0, -1, x0)
+        conf[x0 != self.mask_idx] = -torch.inf
+        conf_v, _ = torch.topk(conf, step_size, dim=-1)
+        mask = (conf - conf_v[None, None, :]).to(xt.dtype)
+        xs = mask * xt + (1 - mask) * x0
+        return SchedulerOutput(xs, xt_prob=None, x0_prob=p_x0.softmax(dim=-1), noise=noise)
     
 
 class GillespieScheduler(EulerScheduler):
