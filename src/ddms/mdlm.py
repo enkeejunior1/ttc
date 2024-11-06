@@ -213,14 +213,13 @@ class MaskGITScheduler(Scheduler):
         # generate x0 ~ p_x0
         logits = self.output_to_logits(output, xt)
         p_x0 = logits.exp()
-        p_x0[:, :, self.mask_idx] = -torch.inf
         x0, noise = sample_categorical(p_x0)
 
         # mask x0 w.r.t confidence 
-        conf = torch.gather(p_x0, -1, x0)
-        conf[x0 != self.mask_idx] = -torch.inf
-        conf_v, _ = torch.topk(conf, step_size, dim=-1)
-        mask = (conf - conf_v[None, None, :]).to(xt.dtype)
+        conf = torch.gather(p_x0, -1, x0[..., None])
+        conf[xt != self.mask_idx] = -torch.inf
+        conf_v, _ = torch.topk(conf.squeeze(-1), step_size, dim=1)
+        mask = (conf >= conf_v.min(dim=1, keepdim=True).values.squeeze(-1)).to(xt)
         xs = mask * xt + (1 - mask) * x0
         return SchedulerOutput(xs, xt_prob=None, x0_prob=p_x0.softmax(dim=-1), noise=noise)
     
