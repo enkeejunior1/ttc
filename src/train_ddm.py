@@ -185,7 +185,7 @@ def main():
                 print (f"Step: {step}. PPL: {ppl}. Token Accuracy: {token_accuracy}")
             step += 1
         teacher.save_pretrained(os.path.join(args.save_model, f'checkpoint_{epoch}'))
-        accuracy, token_accuracy, ppl = evaluate(val_dataloader, tokenizer, ctx, teacher, args.max_new_tokens)
+        accuracy, token_accuracy, ppl = evaluate(val_dataloader, tokenizer, ctx, teacher, scheduler, args.max_new_tokens)
         print (f'Val. PPL: {ppl}; Accuracy: {accuracy}; Token Accuracy: {token_accuracy}.')
         
 if __name__ == "__main__":

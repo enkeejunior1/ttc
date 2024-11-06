@@ -130,21 +130,20 @@ class Scheduler(nn.Module):
         pass
     
     @torch.no_grad()
-    def euler_sample(self, model, xt, t, s, euler_steps=1, sample_steps=5):
+    def euler_sample(self, model, xt, t, s, num_inference_steps=5):
         '''xt -> xu, with euler sampling'''
-        assert euler_steps == 1, 'notimplemented error for euler_steps > 1'
         assert (t > s).all(), f'{t}, {s}'
         assert (s > 0).all(), f'{s}, {self.eps}'
-        timesteps = torch.linspace(1, self.eps, sample_steps+1, device=xt.device)
+        timesteps = torch.linspace(1, self.eps, num_inference_steps+1, device=xt.device)
         timesteps = (t[:, None] - s[:, None]) * timesteps[None, :] + s[:, None]
         noises = []
         xt_traj = []
-        for i in range(sample_steps):
+        for i in range(num_inference_steps):
             dt = timesteps[:, i] - timesteps[:, i+1]
             curr_t = timesteps[:, i]
 
             sigma_bar_t = self.sigma_bar(curr_t)
-            output = model(xt, sigma_x=sigma_bar_t)
+            output = model(xt, sigma_bar_t)
             output = self.step(output, xt, curr_t, dt)
             xt = output.xt
             
