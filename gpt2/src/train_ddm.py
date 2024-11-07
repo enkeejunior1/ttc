@@ -131,6 +131,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
+    parser.add_argument('--scheduler_name', type=str, default='euler')
     args = parser.parse_args()
 
     print (args)

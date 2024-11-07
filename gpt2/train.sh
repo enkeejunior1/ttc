@@ -3,7 +3,7 @@
 #########
 export FOLDER=data/gsm8k
 export EPOCHS=1
-export LR=5e-5
+export LR=3e-4
 export BSZ=32
 
 # MDLM
@@ -23,20 +23,20 @@ python3 src/train_ddm.py \
     --save_model $SAVE
 
 # GPT2
-export MODEL=gpt2
-export SAVE="train_models/gsm8k/$MODEL/teacher"
-echo $SAVE
-mkdir -p $SAVE
-TOKENIZERS_PARALLELISM=false
-CUDA_VISIBLE_DEVICES=1
-python3 src/train_gpt.py \
-    --train_path ${FOLDER}/train.txt \
-    --val_path ${FOLDER}/valid.txt \
-    --epochs $EPOCHS \
-    --lr $LR \
-    --batch_size $BSZ \
-    --base_model $MODEL \
-    --save_model $SAVE
+# export MODEL=gpt2
+# export SAVE="train_models/gsm8k/$MODEL/teacher"
+# echo $SAVE
+# mkdir -p $SAVE
+# TOKENIZERS_PARALLELISM=false
+# CUDA_VISIBLE_DEVICES=1
+# python3 src/train_gpt.py \
+#     --train_path ${FOLDER}/train.txt \
+#     --val_path ${FOLDER}/valid.txt \
+#     --epochs $EPOCHS \
+#     --lr $LR \
+#     --batch_size $BSZ \
+#     --base_model $MODEL \
+#     --save_model $SAVE
 
 
 # teacher (explicit CoT)
